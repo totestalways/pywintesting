@@ -1,0 +1,63 @@
+import os
+import json
+from typing import Any, Dict
+
+# ------------- CONFIG -------------
+INPUT_JSON_PATH: str = "./exports/Target_ui_map_20250101_120000.json"
+OUTPUT_DIR: str = "./exports"
+OUTPUT_MODULE_BASENAME: str = "my_ui_map"   # produces my_ui_map.py
+OUTPUT_VARIABLE_NAME: str = "UI_MAP"        # top-level variable name in the .py
+OUTPUT_CLASS_NAME: str = "UIMap"            # class name in the .py
+# If your JSON was wrapped under a top-level key (JSON_TOP_LEVEL_VAR), put that key here.
+# If your JSON is a raw mapping, set to None.
+JSON_TOP_LEVEL_KEY: str = None
+# ----------------------------------
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def _load_mapping(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if JSON_TOP_LEVEL_KEY:
+        data = data[JSON_TOP_LEVEL_KEY]
+    if not isinstance(data, dict):
+        raise ValueError("Loaded JSON is not a dict mapping.")
+    return data
+
+def _emit_python_module(mapping: Dict[str, Any], out_dir: str, base_name: str,
+                        var_name: str, class_name: str) -> str:
+    _ensure_dir(out_dir)
+    out_path = os.path.join(out_dir, f"{base_name}.py")
+
+    # Pretty-serialize dict in Python syntax
+    import pprint
+    pretty_dict = pprint.pformat(mapping, width=100, compact=False, sort_dicts=False)
+
+    content = f'''# Auto-generated from JSON: do not edit by hand.
+# flake8: noqa
+
+{var_name} = {pretty_dict}
+
+class {class_name}:
+    """Container for the UI mapping."""
+    DATA = {var_name}
+
+    # Convenience helpers (static):
+    get = staticmethod(lambda key, default=None: {var_name}.get(key, default))
+    keys = staticmethod(lambda: {var_name}.keys())
+    items = staticmethod(lambda: {var_name}.items())
+    values = staticmethod(lambda: {var_name}.values())
+'''
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return out_path
+
+def main():
+    mapping = _load_mapping(INPUT_JSON_PATH)
+    py_path = _emit_python_module(mapping, OUTPUT_DIR, OUTPUT_MODULE_BASENAME,
+                                  OUTPUT_VARIABLE_NAME, OUTPUT_CLASS_NAME)
+    print(f"[OK] Wrote Python module: {py_path}")
+
+if __name__ == "__main__":
+    main()
