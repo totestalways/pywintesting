@@ -1,0 +1,305 @@
+import sys
+import re
+import os
+import json
+from datetime import datetime
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict, Any
+
+from pywinauto import Desktop
+from pywinauto.controls.uiawrapper import UIAWrapper
+
+from PyQt5.QtCore import QRect, Qt, QSize
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QPushButton, QLabel, QLineEdit,
+    QComboBox, QCheckBox, QScrollArea, QVBoxLayout, QFrame, QHBoxLayout
+)
+
+# ---------------------------
+# CONFIG: tweak as you like
+# ---------------------------
+TARGET_TITLE: str = r"Notepad"     # Regex title of the target window (example: Notepad). Change to your app.
+USE_REGEX: bool = True             # If False, uses exact title match.
+BACKEND: str = "uia"               # Must be "uia" for UIA tree support
+MAX_DEPTH: Optional[int] = None    # Limit tree depth (None = full)
+INCLUDE_OFFSCREEN: bool = False    # Skip elements that appear offscreen or 0-sized
+MIN_SIZE_PX: int = 2               # Ignore controls smaller than this
+# Which control types to render. Buttons are always included.
+INCLUDED_TYPES: Tuple[str, ...] = (
+    "Button", "Edit", "CheckBox", "ComboBox", "TabItem", "Text",
+    "List", "ListItem", "Tree", "TreeItem", "MenuItem", "RadioButton",
+)
+
+# Simple style hints per type (border thickness in px)
+TYPE_STYLES: Dict[str, Tuple[str, int]] = {
+    "Button": ("#0078D4", 2),
+    "Edit": ("#6A6A6A", 1),
+    "CheckBox": ("#4C9A2A", 2),
+    "ComboBox": ("#8A2BE2", 2),
+    "TabItem": ("#FF8C00", 2),
+    "Text": ("#AAAAAA", 1),
+    "List": ("#2F4F4F", 2),
+    "ListItem": ("#2F4F4F", 1),
+    "Tree": ("#B22222", 2),
+    "TreeItem": ("#B22222", 1),
+    "MenuItem": ("#696969", 1),
+    "RadioButton": ("#DAA520", 2),
+}
+
+# ----- JSON export config (single file in the desired shape) -----
+EXPORT_JSON: bool = True
+EXPORT_DIR: str = "./exports"           # created if missing
+FILENAME_TIMESTAMP: bool = True
+# If you want the JSON to be a raw object mapping, leave JSON_TOP_LEVEL_VAR=None.
+# If you want the JSON to wrap the mapping under a top-level variable name, set this string.
+# Example: JSON_TOP_LEVEL_VAR = "UI_MAP" will produce: { "UI_MAP": { ...actual map... } }
+JSON_TOP_LEVEL_VAR: Optional[str] = None
+
+
+@dataclass
+class ControlInfo:
+    control_type: str
+    name: str
+    rect: Tuple[int, int, int, int]  # (left, top, right, bottom) in screen coords
+    depth: int
+    automation_id: str
+    class_name: str
+
+
+def get_target_window(title_pattern: str, use_regex: bool, backend: str) -> UIAWrapper:
+    desk = Desktop(backend=backend)
+    win = desk.window(title_re=title_pattern) if use_regex else desk.window(title=title_pattern)
+    wrapper = win.wrapper_object()
+    try:
+        wrapper.set_focus()
+    except Exception:
+        pass
+    return wrapper
+
+
+def collect_controls(win: UIAWrapper,
+                     max_depth: Optional[int],
+                     include_offscreen: bool,
+                     min_size_px: int) -> List[ControlInfo]:
+    try:
+        client_rect = win.client_rect()
+    except Exception:
+        client_rect = win.rectangle()
+
+    descendants = win.descendants()
+
+    results: List[ControlInfo] = []
+    for w in descendants:
+        try:
+            ei = w.element_info
+            ctype = ei.control_type or ""
+            name = ei.name or ""
+            aid = getattr(ei, "automation_id", "") or ""
+            cls = getattr(ei, "class_name", "") or ""
+
+            depth = getattr(w, "depth", 0)
+
+            rect = w.rectangle()
+            left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+            width, height = right - left, bottom - top
+
+            if width < min_size_px or height < min_size_px:
+                continue
+
+            if not include_offscreen:
+                if any(v is None for v in (left, top, right, bottom)):
+                    continue
+                if width <= 0 or height <= 0:
+                    continue
+
+            results.append(ControlInfo(
+                control_type=ctype,
+                name=name,
+                rect=(left, top, right, bottom),
+                depth=depth,
+                automation_id=aid,
+                class_name=cls
+            ))
+        except Exception:
+            continue
+
+    collect_controls.client_rect = (
+        client_rect.left, client_rect.top, client_rect.right, client_rect.bottom
+    )
+    return results
+
+
+# ---------------------------
+# JSON export (single file)
+# ---------------------------
+
+def _safe_title_to_basename(title: str) -> str:
+    base = re.sub(r"[^\w\-. ]+", "_", title.strip()) or "target"
+    return base[:80].strip()
+
+
+def _unique_key(name: str, existing: Dict[str, Any]) -> str:
+    if name not in existing:
+        return name
+    i = 2
+    while f"{name} ({i})" in existing:
+        i += 1
+    return f"{name} ({i})"
+
+
+def _display_name(c: ControlInfo, counters: Dict[str, int]) -> str:
+    if c.name and c.name.strip():
+        return c.name.strip()
+    key = c.control_type or "Control"
+    counters[key] = counters.get(key, 0) + 1
+    return f"<Unnamed {key} #{counters[key]}>"
+
+
+def export_single_json(window_title: str, controls: List[ControlInfo]) -> str:
+    """
+    Write ONE JSON file with shape:
+        { "Element Name": {"automation_id": str, "control_type": str, "rect": {...}}, ... }
+    Returns the file path.
+    """
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    base = _safe_title_to_basename(window_title)
+    ts = f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}" if FILENAME_TIMESTAMP else ""
+    path_json = os.path.join(EXPORT_DIR, f"{base}_ui_map{ts}.json")
+
+    mapping: Dict[str, Dict[str, Any]] = {}
+    name_counters: Dict[str, int] = {}
+
+    for c in controls:
+        name = _display_name(c, name_counters)
+        key = _unique_key(name, mapping)
+        l, t, r, b = c.rect
+        mapping[key] = {
+            "automation_id": c.automation_id or "",
+            "control_type": c.control_type or "",
+            "rect": {"left": l, "top": t, "right": r, "bottom": b},
+        }
+
+    # Either dump raw mapping or wrap under a single top-level key
+    payload: Any = {JSON_TOP_LEVEL_VAR: mapping} if JSON_TOP_LEVEL_VAR else mapping
+
+    with open(path_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path_json
+
+
+# ---------------------------
+# UI Mockup (unchanged)
+# ---------------------------
+
+class MockupCanvas(QWidget):
+    def __init__(self, client_rect: Tuple[int, int, int, int], controls: List[ControlInfo]):
+        super().__init__()
+        self.client_left, self.client_top, self.client_right, self.client_bottom = client_rect
+        self.controls = controls
+        client_w = max(200, self.client_right - self.client_left)
+        client_h = max(200, self.client_bottom - self.client_top)
+        self.setMinimumSize(QSize(client_w, client_h))
+        self.build_controls()
+
+    def build_controls(self):
+        for c in self.controls:
+            if c.control_type not in INCLUDED_TYPES and c.control_type != "Button":
+                continue
+            l, t, r, b = c.rect
+            x = l - self.client_left
+            y = t - self.client_top
+            w = max(1, r - l)
+            h = max(1, b - t)
+            widget = self._make_widget_for_control(c)
+            widget.setParent(self)
+            widget.setGeometry(QRect(x, y, w, h))
+            tooltip = (f"Type: {c.control_type}\n"
+                       f"Name: {c.name}\n"
+                       f"AutomationId: {c.automation_id}\n"
+                       f"ClassName: {c.class_name}\n"
+                       f"Rect: ({l},{t},{r},{b})")
+            widget.setToolTip(tooltip)
+            color, thick = TYPE_STYLES.get(c.control_type, ("#555555", 1))
+            widget.setStyleSheet(
+                f"{widget.metaObject().className()} {{"
+                f"border: {thick}px solid {color};"
+                f"border-radius: 4px;"
+                f"}}"
+            )
+
+    def _make_widget_for_control(self, c: ControlInfo) -> QWidget:
+        if c.control_type == "Button":
+            btn = QPushButton(c.name or "Button")
+            f = QFont(); f.setPointSize(9)
+            btn.setFont(f)
+            btn.setEnabled(False)
+            return btn
+        if c.control_type == "Edit":
+            le = QLineEdit(); le.setPlaceholderText(c.name or "Edit"); le.setReadOnly(True); return le
+        if c.control_type == "CheckBox":
+            cb = QCheckBox(c.name or "CheckBox"); cb.setEnabled(False); return cb
+        if c.control_type == "ComboBox":
+            combo = QComboBox(); combo.addItem(c.name or "ComboBox"); combo.setEnabled(False); return combo
+        lab = QLabel(c.name or c.control_type or "Control")
+        lab.setAlignment(Qt.AlignCenter)
+        f = QFont(); f.setPointSize(8); lab.setFont(f)
+        lab.setFrameStyle(QFrame.StyledPanel)
+        return lab
+
+
+class Legend(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QHBoxLayout(self); layout.setContentsMargins(6, 6, 6, 6)
+        title = QLabel("Legend:"); title.setStyleSheet("font-weight: 600;"); layout.addWidget(title)
+        def chip(text, color):
+            w = QLabel(text); w.setStyleSheet(f"border: 2px solid {color}; border-radius: 6px; padding: 2px 6px;")
+            layout.addWidget(w)
+        for t, (color, _) in TYPE_STYLES.items():
+            if t in INCLUDED_TYPES or t == "Button": chip(t, color)
+        layout.addStretch(1)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, window_title: str, client_rect, controls: List[ControlInfo]):
+        super().__init__()
+        self.setWindowTitle(f"Mockup: {window_title}")
+        legend = Legend(); canvas = MockupCanvas(client_rect, controls)
+        scroll = QScrollArea(); scroll.setWidget(canvas); scroll.setWidgetResizable(False)
+        wrapper = QWidget(); v = QVBoxLayout(wrapper); v.addWidget(legend); v.addWidget(scroll)
+        self.setCentralWidget(wrapper)
+        self.resize(min(1200, canvas.width() + 40), min(800, canvas.height() + 120))
+
+
+def main():
+    try:
+        win = get_target_window(TARGET_TITLE, USE_REGEX, BACKEND)
+    except Exception as e:
+        print(f"[Error] Could not find/connect to a window with title "
+              f"{'regex' if USE_REGEX else 'exact'}='{TARGET_TITLE}'.\n{e}")
+        sys.exit(1)
+
+    controls = collect_controls(win, MAX_DEPTH, INCLUDE_OFFSCREEN, MIN_SIZE_PX)
+    client_rect = getattr(collect_controls, "client_rect", None)
+    if client_rect is None:
+        wr = win.rectangle(); client_rect = (wr.left, wr.top, wr.right, wr.bottom)
+
+    # Visual filter (mockup); export uses ALL controls
+    filtered: List[ControlInfo] = []
+    for c in controls:
+        if c.control_type == "Button" or c.control_type in INCLUDED_TYPES:
+            filtered.append(c)
+
+    if EXPORT_JSON:
+        json_path = export_single_json(win.window_text() or "Target", controls)
+        print(f"[Info] UI map JSON written to: {json_path}")
+
+    app = QApplication(sys.argv)
+    mw = MainWindow(win.window_text() or "Target", client_rect, filtered)
+    mw.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
