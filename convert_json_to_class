@@ -1,20 +1,30 @@
 import os
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 # ------------- CONFIG -------------
-INPUT_JSON_PATH: str = "./exports/Target_ui_map_20250101_120000.json"
+INPUT_JSON_PATH: str = "./exports/Target_ui_map_20250924_131540.json"
+
 OUTPUT_DIR: str = "./exports"
-OUTPUT_MODULE_BASENAME: str = "my_ui_map"   # produces my_ui_map.py
-OUTPUT_VARIABLE_NAME: str = "UI_MAP"        # top-level variable name in the .py
-OUTPUT_CLASS_NAME: str = "UIMap"            # class name in the .py
-# If your JSON was wrapped under a top-level key (JSON_TOP_LEVEL_VAR), put that key here.
-# If your JSON is a raw mapping, set to None.
-JSON_TOP_LEVEL_KEY: str = None
+OUTPUT_MODULE_BASENAME: str = "my_ui_map"   # -> my_ui_map.py
+
+# Top-level variable names in the generated .py
+OUTPUT_VARIABLE_NAME: str = "UI_MAP"
+OUTPUT_CONTROL_TYPES_VAR: str = "CONTROL_TYPES"
+OUTPUT_RECTS_VAR: str = "RECTS"
+OUTPUT_CENTERS_VAR: str = "CENTERS"
+
+# Class name in the generated .py
+OUTPUT_CLASS_NAME: str = "UIMap"
+
+# If your JSON is wrapped under a top-level key, set it here; otherwise None.
+JSON_TOP_LEVEL_KEY = None
 # ----------------------------------
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
 
 def _load_mapping(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -22,42 +32,98 @@ def _load_mapping(path: str) -> Dict[str, Any]:
     if JSON_TOP_LEVEL_KEY:
         data = data[JSON_TOP_LEVEL_KEY]
     if not isinstance(data, dict):
-        raise ValueError("Loaded JSON is not a dict mapping.")
+        raise ValueError("Loaded JSON is not a dict mapping of element name -> {automation_id, control_type, rect}.")
     return data
 
-def _emit_python_module(mapping: Dict[str, Any], out_dir: str, base_name: str,
-                        var_name: str, class_name: str) -> str:
+
+def _center_of_rect(rect: Dict[str, int]) -> Tuple[int, int]:
+    l, t, r, b = rect.get("left", 0), rect.get("top", 0), rect.get("right", 0), rect.get("bottom", 0)
+    cx = (l + r) // 2
+    cy = (t + b) // 2
+    return cx, cy
+
+
+def _derive_maps(mapping: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, Dict[str, int]], Dict[str, Tuple[int, int]]]:
+    control_types: Dict[str, str] = {}
+    rects: Dict[str, Dict[str, int]] = {}
+    centers: Dict[str, Tuple[int, int]] = {}
+
+    for name, info in mapping.items():
+        # Be tolerant to partial data
+        ctype = (info or {}).get("control_type", "")
+        rect = (info or {}).get("rect", {}) or {}
+        control_types[name] = ctype
+        rects[name] = {k: int(rect.get(k, 0)) for k in ("left", "top", "right", "bottom")}
+        centers[name] = _center_of_rect(rects[name])
+
+    return control_types, rects, centers
+
+
+def _emit_python_module(mapping: Dict[str, Any],
+                        ctl_types: Dict[str, str],
+                        rects: Dict[str, Dict[str, int]],
+                        centers: Dict[str, Tuple[int, int]],
+                        out_dir: str, base_name: str,
+                        map_var: str, types_var: str, rects_var: str, centers_var: str,
+                        class_name: str) -> str:
     _ensure_dir(out_dir)
     out_path = os.path.join(out_dir, f"{base_name}.py")
 
-    # Pretty-serialize dict in Python syntax
     import pprint
-    pretty_dict = pprint.pformat(mapping, width=100, compact=False, sort_dicts=False)
+    p_map = pprint.pformat(mapping, width=100, compact=False, sort_dicts=False)
+    p_types = pprint.pformat(ctl_types, width=100, compact=False, sort_dicts=False)
+    p_rects = pprint.pformat(rects, width=100, compact=False, sort_dicts=False)
+    p_centers = pprint.pformat(centers, width=100, compact=False, sort_dicts=False)
 
     content = f'''# Auto-generated from JSON: do not edit by hand.
 # flake8: noqa
 
-{var_name} = {pretty_dict}
+{map_var} = {p_map}
+
+{types_var} = {p_types}
+
+{rects_var} = {p_rects}
+
+{centers_var} = {p_centers}
 
 class {class_name}:
-    """Container for the UI mapping."""
-    DATA = {var_name}
+    \"\"\"Container for the UI mapping and derived views.\"\"\"
+    DATA = {map_var}
+    CONTROL_TYPES = {types_var}
+    RECTS = {rects_var}
+    CENTERS = {centers_var}
 
-    # Convenience helpers (static):
-    get = staticmethod(lambda key, default=None: {var_name}.get(key, default))
-    keys = staticmethod(lambda: {var_name}.keys())
-    items = staticmethod(lambda: {var_name}.items())
-    values = staticmethod(lambda: {var_name}.values())
+    # Convenience helpers:
+    get = staticmethod(lambda key, default=None: {map_var}.get(key, default))
+    get_type = staticmethod(lambda key, default="": {types_var}.get(key, default))
+    get_rect = staticmethod(lambda key, default=None: {rects_var}.get(key, default))
+    get_center = staticmethod(lambda key, default=None: {centers_var}.get(key, default))
+
+    keys = staticmethod(lambda: {map_var}.keys())
+    items = staticmethod(lambda: {map_var}.items())
+    values = staticmethod(lambda: {map_var}.values())
 '''
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(content)
     return out_path
 
+
 def main():
     mapping = _load_mapping(INPUT_JSON_PATH)
-    py_path = _emit_python_module(mapping, OUTPUT_DIR, OUTPUT_MODULE_BASENAME,
-                                  OUTPUT_VARIABLE_NAME, OUTPUT_CLASS_NAME)
+    ctl_types, rects, centers = _derive_maps(mapping)
+
+    py_path = _emit_python_module(
+        mapping, ctl_types, rects, centers,
+        out_dir=OUTPUT_DIR,
+        base_name=OUTPUT_MODULE_BASENAME,
+        map_var=OUTPUT_VARIABLE_NAME,
+        types_var=OUTPUT_CONTROL_TYPES_VAR,
+        rects_var=OUTPUT_RECTS_VAR,
+        centers_var=OUTPUT_CENTERS_VAR,
+        class_name=OUTPUT_CLASS_NAME,
+    )
     print(f"[OK] Wrote Python module: {py_path}")
+
 
 if __name__ == "__main__":
     main()
