@@ -1,10 +1,11 @@
 import csv
 import datetime as dt
+import os
 import re
 import sys
 from pathlib import Path
 
-import oracledb  # pip install python-oracledb
+import cx_Oracle  # pip install "cx_Oracle==8.3.*"
 
 # ----------------------------- CONFIG ---------------------------------
 DB_HOST       = "db.example.com"
@@ -16,16 +17,33 @@ DB_PASSWORD   = "tiger"
 SCHEMA        = "SALES"         # schema/owner to scan (unquoted identifier)
 TIME_COLUMN   = "CREATED_AT"    # time column in target tables (unquoted)
 
-# Time window (inclusive start, exclusive end) — set to None to scan all.
-# FORMAT MUST BE: "YYYYMMDD-HH:MM:SS.ffffff"
+# Time window (inclusive start, exclusive end). Use None to scan all.
+# REQUIRED FORMAT: "YYYYMMDD-HH:MM:SS.ffffff"
 START_TS_STR  = "20251001-00:00:00.000000"   # or None
 END_TS_STR    = "20251009-00:00:00.000000"   # or None
 
 # Optional: force a specific session time zone (e.g., "UTC", "Europe/Bucharest")
 SESSION_TIME_ZONE = None
 
-OUTPUT_DIR    = "hourly_counts" # folder where CSVs will be saved
+OUTPUT_DIR    = "hourly_counts"  # folder where CSVs will be saved
 # ----------------------------------------------------------------------
+
+
+# If you prefer to point explicitly to your Instant Client dir, set this env var:
+#   export ORACLE_CLIENT_LIB_DIR=/path/to/instantclient_19_23
+CLIENT_LIB_DIR = os.environ.get("ORACLE_CLIENT_LIB_DIR")
+
+
+def init_client_if_needed():
+    """
+    Initialize Oracle Client if a lib dir is given (useful on Windows/macOS).
+    If libs are already on PATH/LD_LIBRARY_PATH/DYLD_LIBRARY_PATH, you can skip this.
+    """
+    if CLIENT_LIB_DIR:
+        try:
+            cx_Oracle.init_oracle_client(lib_dir=CLIENT_LIB_DIR)
+        except Exception as e:
+            print(f"⚠️ Could not init Oracle Client at {CLIENT_LIB_DIR}: {e}", file=sys.stderr)
 
 
 IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")  # simple Oracle identifier check
@@ -36,16 +54,13 @@ def assert_safe_identifier(name: str, kind: str):
         raise ValueError(f"Unsafe {kind} identifier: {name!r}. Use simple, unquoted names.")
 
 
-def dsn(host: str, port: int, service: str) -> str:
-    # Thin mode DSN format
-    return f"{host}:{port}/{service}"
+def make_dsn(host: str, port: int, service: str) -> str:
+    # Easy Connect works too ("host:port/service"), but makedsn is explicit/cross-platform.
+    return cx_Oracle.makedsn(host, port, service_name=service)
 
 
 def parse_ts(s: str | None) -> dt.datetime | None:
-    """
-    Parse 'YYYYMMDD-HH:MM:SS.ffffff' into a Python datetime, or None.
-    Example: '20251009-00:00:00.000000'
-    """
+    """Parse 'YYYYMMDD-HH:MM:SS.ffffff' into a Python datetime, or None."""
     if not s:
         return None
     return dt.datetime.strptime(s, "%Y%m%d-%H:%M:%S.%f")
@@ -117,7 +132,15 @@ def fmt_hour(value) -> str:
     return dt.datetime.combine(value, dt.time()).strftime("%Y-%m-%d %H:00")
 
 
+def safe_csv_name(schema: str, table: str) -> str:
+    base = f"{schema}_{table}"
+    return re.sub(r"[^A-Za-z0-9._-]", "_", base) + ".csv"
+
+
 def main():
+    # Init client if a lib dir is provided
+    init_client_if_needed()
+
     # Normalize identifiers to dictionary case (Oracle stores unquoted identifiers uppercase)
     schema = SCHEMA.upper()
     time_col = TIME_COLUMN.upper()
@@ -128,9 +151,9 @@ def main():
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Connect (thin mode; no Instant Client required)
+    dsn = make_dsn(DB_HOST, DB_PORT, DB_SERVICE)
     try:
-        conn = oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=dsn(DB_HOST, DB_PORT, DB_SERVICE))
+        conn = cx_Oracle.connect(user=DB_USER, password=DB_PASSWORD, dsn=dsn, encoding="UTF-8")
     except Exception as e:
         print(f"❌ Failed to connect: {e}", file=sys.stderr)
         sys.exit(2)
@@ -156,7 +179,7 @@ def main():
         for tbl in tables:
             try:
                 rows = hourly_counts(conn, schema, tbl, time_col, start_ts, end_ts)
-                csv_path = out_dir / (f"{schema}_{tbl}.csv")
+                csv_path = out_dir / safe_csv_name(schema, tbl)
                 # Write per-table CSV
                 with open(csv_path, "w", newline="", encoding="utf-8") as f:
                     w = csv.writer(f)
