@@ -1,5 +1,17 @@
-# hourly_counts_robust.py
+# hourly_counts_bound_ends.py
 # pip install oracledb pandas
+#
+# What it creates (in ./oracle_hourly_counts_out):
+#  - {SCHEMA}.{TABLE}_counts_20251009.csv          (per-table hourly counts: hour,count)
+#  - all_tables_hourly_counts_20251009.csv         (schema,table,hour,count for all tables)
+#  - totals_all_tables_20251009.csv                (table,total_count)
+#  - top10_tables_by_total_count_20251009.csv      (Top 10 by total_count)
+#  - errors_20251009.csv                           (if any failures)
+#
+# Notes
+# - No CLI args: edit CONFIG and run.
+# - 1-hour windows are computed in Python; SQL receives :window_start and :window_end.
+# - If your time column isn't DATE/TIMESTAMP, set TIME_KIND_MAP/TEXT_MASK_MAP accordingly.
 
 import datetime as dt
 from pathlib import Path
@@ -9,46 +21,48 @@ import oracledb
 # ========== CONFIG ==========
 HOST = "your-db-host"
 PORT = 1521
-SERVICE_NAME = "your_service_name"
+SERVICE_NAME = "your_service_name"  # e.g. "orclpdb1" or "xe"
+
 DB_USER = "YOUR_USER"
 DB_PASSWORD = "YOUR_PASSWORD"
-SCHEMA = "YOUR_SCHEMA"  # Oracle owner
 
-# Default time column name (UPPERCASE). Override per-table below.
+SCHEMA = "YOUR_SCHEMA"          # Oracle owner (dictionary views expect UPPERCASE)
+
+# Default time column name (UPPERCASE). Override per table with TIME_COLUMN_MAP.
 TIME_COLUMN_DEFAULT = "TIME"
-
-# Per-table time column overrides (all UPPERCASE)
 TIME_COLUMN_MAP = {
     # "ORDERS": "CREATED_AT",
-    # "LOGS": "EVENT_TS",
+    # "EVENTS": "EVENT_TS",
 }
 
 # Tell the script how to interpret non-native time columns.
 # Allowed kinds:
-#   "NATIVE" (DATE/TIMESTAMP/TIMESTAMP WITH (LOCAL) TIME ZONE)
-#   "TEXT_MASK" (VARCHAR2 to TO_TIMESTAMP)
-#   "EPOCH_SECONDS" | "EPOCH_MILLIS" | "EPOCH_MICROS" (NUMBER epoch)
-#   "YYYYMMDDHH24MISS" (NUMBER)
-#   "YYYYMMDDHH24MISSFF6" (NUMBER)
+#   "NATIVE"               -> DATE / TIMESTAMP / TIMESTAMP WITH (LOCAL) TIME ZONE
+#   "TEXT_MASK"            -> VARCHAR2/CHAR; will apply TO_TIMESTAMP with a mask
+#   "EPOCH_SECONDS"        -> NUMBER epoch seconds since 1970-01-01
+#   "EPOCH_MILLIS"         -> NUMBER epoch milliseconds
+#   "EPOCH_MICROS"         -> NUMBER epoch microseconds
+#   "YYYYMMDDHH24MISS"     -> NUMBER like 20251009123059
+#   "YYYYMMDDHH24MISSFF6"  -> NUMBER like 20251009123059ffffff (microseconds)
 TIME_KIND_DEFAULT = "NATIVE"
 TIME_KIND_MAP = {
-    # "EVENTS": "EPOCH_MILLIS",
     # "RAWLOG": "TEXT_MASK",
+    # "EVT_MS": "EPOCH_MILLIS",
     # "LEGACY": "YYYYMMDDHH24MISS",
 }
 
 # For TEXT_MASK tables, provide a TO_TIMESTAMP mask (per table or default)
-TEXT_MASK_DEFAULT = "YYYYMMDD-HH24:MI:SS.FF6"  # matches 20251009-00:00:00.000000
+TEXT_MASK_DEFAULT = "YYYYMMDD-HH24:MI:SS.FF6"  # matches '20251009-00:00:00.000000'
 TEXT_MASK_MAP = {
     # "RAWLOG": "YYYY-MM-DD\"T\"HH24:MI:SS.FF3",
 }
 
-# Day to scan (YYYYMMDD). End is next midnight (exclusive).
-DAY_STR = "20251009"
+# Day to scan (inclusive start; exclusive end = next midnight)
+DAY_STR = "20251009"  # YYYYMMDD
 
 OUT_DIR = Path("oracle_hourly_counts_out")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-# ============================
+# ===========================
 
 
 def _dsn():
@@ -57,7 +71,7 @@ def _dsn():
 
 def _day_bounds(day_str: str):
     d = dt.datetime.strptime(day_str, "%Y%m%d")
-    start = dt.datetime(d.year, d.month, d.day, 0, 0, 0, 0)
+    start = d.replace(hour=0, minute=0, second=0, microsecond=0)
     end_excl = start + dt.timedelta(days=1)
     return start, end_excl
 
@@ -84,12 +98,11 @@ def _get_col_meta(conn, owner: str, table: str, col: str):
     """
     with conn.cursor() as cur:
         cur.execute(sql, owner=owner.upper(), table_name=table.upper(), col=col.upper())
-        row = cur.fetchone()
-    return row  # (DATA_TYPE, DATA_LENGTH, DATA_PRECISION, DATA_SCALE) or None
+        return cur.fetchone()  # or None
 
 
 def _time_kind_for(table: str, data_type: str):
-    # If user overrode, trust it; else infer basics.
+    # Respect explicit per-table mapping first.
     kind = TIME_KIND_MAP.get(table.upper())
     if kind:
         return kind
@@ -100,25 +113,21 @@ def _time_kind_for(table: str, data_type: str):
     elif dtp in ("VARCHAR2", "CHAR", "NCHAR", "NVARCHAR2"):
         return "TEXT_MASK"
     elif dtp == "NUMBER":
-        # Fall back to epoch seconds if not configured.
+        # Default assumption for NUMBER is epoch seconds unless overridden.
         return "EPOCH_SECONDS"
-    else:
-        return TIME_KIND_DEFAULT
+    return TIME_KIND_DEFAULT
 
 
-def _expr_ts(owner: str, table: str, col: str, data_type: str):
+def _expr_ts(table: str, col: str, data_type: str):
     """
-    Returns a SQL expression that converts t.<col> to TIMESTAMP safely.
-    We don't bind masks/kinds; they come from the config above.
+    Build a SQL expression that converts t.<col> to TIMESTAMP based on the column kind.
+    Return a string like "TO_TIMESTAMP(t.COL,'YYYY..')" or "CAST(t.COL AS TIMESTAMP)".
     """
     tname = table.upper()
+    c = col.upper()
     kind = _time_kind_for(tname, data_type)
 
-    # Fully qualified table already used outside; we only need "t.<col>" here.
-    c = col.upper()
-
     if kind == "NATIVE":
-        # Works for DATE and TIMESTAMP* types; cast for consistent typing.
         return f"CAST(t.{c} AS TIMESTAMP)"
 
     if kind == "TEXT_MASK":
@@ -126,7 +135,6 @@ def _expr_ts(owner: str, table: str, col: str, data_type: str):
         return f"TO_TIMESTAMP(t.{c}, '{mask}')"
 
     if kind == "EPOCH_SECONDS":
-        # 1970-01-01 + seconds
         return ("TO_TIMESTAMP('1970-01-01 00:00:00','YYYY-MM-DD HH24:MI:SS') "
                 f"+ NUMTODSINTERVAL(t.{c}, 'SECOND')")
 
@@ -139,18 +147,21 @@ def _expr_ts(owner: str, table: str, col: str, data_type: str):
                 f"+ NUMTODSINTERVAL(t.{c}/1000000, 'SECOND')")
 
     if kind == "YYYYMMDDHH24MISS":
-        # Ensure leading zeros by padding to 14
         return f"TO_TIMESTAMP(LPAD(TO_CHAR(t.{c}),14,'0'),'YYYYMMDDHH24MISS')"
 
     if kind == "YYYYMMDDHH24MISSFF6":
-        # Pad to 20
         return f"TO_TIMESTAMP(LPAD(TO_CHAR(t.{c}),20,'0'),'YYYYMMDDHH24MISSFF6')"
 
-    # Fallback: treat as native (may still fail if truly numeric/text without config)
+    # Fallback (acts like NATIVE)
     return f"CAST(t.{c} AS TIMESTAMP)"
 
 
-def _hourly_counts(conn, owner: str, table: str, time_col: str, start_ts: dt.datetime, end_ts_excl: dt.datetime):
+def _count_window(conn, owner: str, table: str, time_col: str,
+                  window_start: dt.datetime, window_end: dt.datetime) -> int:
+    """
+    Count rows in [window_start, window_end) for the given table/column.
+    Uses a *bound* :window_start and :window_end (no arithmetic in SQL).
+    """
     q_owner = f'"{owner.upper()}"'
     q_table = f'"{table.upper()}"'
 
@@ -159,39 +170,36 @@ def _hourly_counts(conn, owner: str, table: str, time_col: str, start_ts: dt.dat
         raise RuntimeError(f"Column {time_col} not found on {owner}.{table}")
     data_type = meta[0]
 
-    expr_ts = _expr_ts(owner, table, time_col, data_type)
+    expr_ts = _expr_ts(table, time_col, data_type)
 
-    # Bucket by hour: TRUNC(CAST(.. AS DATE),'HH24') gives DATE; cast back to TIMESTAMP for pretty output
     sql = f"""
-        SELECT CAST(TRUNC(CAST({expr_ts} AS DATE), 'HH24') AS TIMESTAMP) AS hour_bucket,
-               COUNT(*) AS cnt
+        SELECT COUNT(*) AS cnt
         FROM   {q_owner}.{q_table} t
-        WHERE  {expr_ts} >= :start_ts
-          AND  {expr_ts} <  :end_ts
-        GROUP  BY CAST(TRUNC(CAST({expr_ts} AS DATE), 'HH24') AS TIMESTAMP)
-        ORDER  BY hour_bucket
+        WHERE  {expr_ts} >= :window_start
+          AND  {expr_ts} <  :window_end
     """
     with conn.cursor() as cur:
-        cur.execute(sql, start_ts=start_ts, end_ts=end_ts_excl)
-        rows = cur.fetchall()
+        cur.execute(sql, window_start=window_start, window_end=window_end)
+        return int(cur.fetchone()[0])
 
-    if not rows:
-        return pd.DataFrame(columns=["hour", "count"])
 
-    df = pd.DataFrame(rows, columns=["hour", "count"])
-    df["hour"] = pd.to_datetime(df["hour"])
-    df["count"] = df["count"].astype("int64")
-    return df
+def _has_time_col(conn, owner: str, table: str, col: str) -> bool:
+    sql = """
+      SELECT 1 FROM all_tab_columns
+      WHERE owner=:owner AND table_name=:t AND column_name=:c
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, owner=owner.upper(), t=table.upper(), c=col.upper())
+        return cur.fetchone() is not None
 
 
 def main():
     start_ts, end_ts_excl = _day_bounds(DAY_STR)
-    hours = pd.date_range(start=start_ts, end=end_ts_excl, freq="H", inclusive="left")
-    hours_df = pd.DataFrame({"hour": hours})
+    hours = list(pd.date_range(start=start_ts, end=end_ts_excl, freq="H", inclusive="left"))
 
-    all_rows = []
-    totals = []
-    errors = []
+    all_rows = []   # schema, table, hour, count
+    totals = []     # (table, total_count)
+    errors = []     # (table, error_message)
 
     print("Connecting to Oracle ...")
     conn = oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=_dsn())
@@ -202,43 +210,54 @@ def main():
         for tbl in tables:
             time_col = TIME_COLUMN_MAP.get(tbl.upper(), TIME_COLUMN_DEFAULT).upper()
 
+            if not _has_time_col(conn, SCHEMA, tbl, time_col):
+                print(f"- Skipping {tbl}: missing time column {time_col}")
+                continue
+
+            print(f"- {tbl}: counting hourly using {time_col} ...")
             try:
-                df_counts = _hourly_counts(conn, SCHEMA, tbl, time_col, start_ts, end_ts_excl)
+                per_table_data = []
+                total = 0
+                for h in hours:
+                    h_next = h + dt.timedelta(hours=1)
+                    cnt = _count_window(conn, SCHEMA, tbl, time_col, h.to_pydatetime(), h_next.to_pydatetime())
+                    per_table_data.append((h, cnt))
+                    total += cnt
 
-                # Ensure full 24-hour coverage
-                df = hours_df.merge(df_counts, on="hour", how="left")
-                df["count"] = df["count"].fillna(0).astype("int64")
+                # Save per-table CSV
+                df = pd.DataFrame(per_table_data, columns=["hour", "count"])
+                df.to_csv(OUT_DIR / f"{SCHEMA.upper()}.{tbl.upper()}_counts_{DAY_STR}.csv", index=False)
 
-                # Per-table CSV
-                per_table_csv = OUT_DIR / f"{SCHEMA.upper()}.{tbl.upper()}_counts_{DAY_STR}.csv"
-                df.to_csv(per_table_csv, index=False)
-
-                # Aggregate rows
+                # Aggregate for the big CSV
                 tmp = df.copy()
                 tmp.insert(0, "table", tbl.upper())
                 tmp.insert(0, "schema", SCHEMA.upper())
                 all_rows.append(tmp)
 
-                totals.append((tbl.upper(), int(df["count"].sum())))
+                # Totals for Top-10
+                totals.append((tbl.upper(), total))
 
             except Exception as e:
                 msg = str(e)
-                print(f"ERROR {tbl}: {msg}")
+                print(f"  ERROR {tbl}: {msg}")
                 errors.append((tbl.upper(), msg))
 
+        # Write aggregated CSV
         if all_rows:
             agg_df = pd.concat(all_rows, ignore_index=True)
             agg_df.to_csv(OUT_DIR / f"all_tables_hourly_counts_{DAY_STR}.csv", index=False)
 
+        # Totals and Top-10
         if totals:
             totals_df = pd.DataFrame(totals, columns=["table", "total_count"]).sort_values(
                 "total_count", ascending=False
             )
             totals_df.to_csv(OUT_DIR / f"totals_all_tables_{DAY_STR}.csv", index=False)
             totals_df.head(10).to_csv(OUT_DIR / f"top10_tables_by_total_count_{DAY_STR}.csv", index=False)
-            print("\nTop 10 tables:")
+            print("\nTop 10 tables by total rows:")
             print(totals_df.head(10).to_string(index=False))
 
+        # Errors
         if errors:
             pd.DataFrame(errors, columns=["table", "error"]).to_csv(
                 OUT_DIR / f"errors_{DAY_STR}.csv", index=False
