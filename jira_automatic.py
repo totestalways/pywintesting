@@ -1,61 +1,80 @@
 # -*- coding: utf-8 -*-
 """
-Create Sub-tasks under multiple parent issues in Jira (Cloud or Server/DC),
-naming each sub-task as: "<SUBTASK_PREFIX> <Parent Issue Summary>".
+Create Sub-tasks under multiple parent issues in Jira (Cloud or Server/DC)
+using atlassian-python-api, naming each as: "<SUBTASK_PREFIX> <Parent Issue Summary>".
 
 Requires:
-    pip install jira
+    pip install atlassian-python-api
 """
 
 from typing import List, Optional, Dict
-from jira import JIRA
-from jira.exceptions import JIRAError
+from atlassian import Jira
+import urllib3
 
 # ==========
 # INPUTS — edit these
 # ==========
-USE_CLOUD = True  # False for Jira Server/DC
 
-# Jira Cloud auth
-JIRA_BASE_URL = "https://your-domain.atlassian.net"
-JIRA_EMAIL = "you@example.com"
-JIRA_API_TOKEN = "YOUR_API_TOKEN_HERE"
+JIRA_BASE_URL = "https://your-domain.atlassian.net"  # or your Server/DC URL
+JIRA_USERNAME_OR_EMAIL = "you@example.com"           # Cloud: email; Server/DC: username (or email if supported)
+JIRA_API_TOKEN_OR_PASSWORD = "YOUR_API_TOKEN_OR_PASSWORD"
 
-# Jira Server/DC auth (only if USE_CLOUD=False)
-JIRA_USERNAME = "your_jira_username"
-JIRA_PASSWORD = "your_password_or_pat"
+# SSL verification (set False if you must, but prefer a proper CA bundle)
+VERIFY_SSL = True  # set to False to skip SSL verification
+if not VERIFY_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PROJECT_KEY = "ABC"
 PARENT_ISSUE_KEYS: List[str] = ["ABC-123", "ABC-456"]
 
-SUBTASK_ISSUE_TYPE_NAME = "Sub-task"   # adjust if your instance renamed it
-SUBTASK_PREFIX = "[Prep]"              # <<< user-defined prefix
+SUBTASK_PREFIX = "[Prep]"               # user-defined prefix
+SUBTASK_ISSUE_TYPE_NAME = "Sub-task"    # adjust if customized in your project
+SUBTASK_DESCRIPTION = "Auto-created sub-task. Please review and complete."
 
 # Optional fields
-LABELS = ["auto-created"]
-COMPONENT_NAMES: List[str] = []        # must already exist in the project
+LABELS: List[str] = ["auto-created"]
+COMPONENT_NAMES: List[str] = []         # must already exist in project, or leave empty
 
-# Assignee (choose one depending on hosting)
-ASSIGNEE_ACCOUNT_ID_CLOUD: Optional[str] = None   # e.g., "557058:abcd..."
-ASSIGNEE_NAME_SERVER: Optional[str] = None        # e.g., "jdoe"
-
-# Optional description (kept constant for all)
-SUBTASK_DESCRIPTION = (
-    "Auto-created sub-task. Please review and complete."
-)
+# Assignee:
+# For Jira Cloud you must use accountId; for Server/DC use username.
+ASSIGNEE_ACCOUNT_ID_CLOUD: Optional[str] = None  # e.g. "557058:abcd..."
+ASSIGNEE_NAME_SERVER: Optional[str] = None       # e.g. "jdoe"
 
 # ========== END OF INPUTS ==========
 
 
-def get_jira_client() -> JIRA:
-    if USE_CLOUD:
-        return JIRA(server=JIRA_BASE_URL, basic_auth=(JIRA_EMAIL, JIRA_API_TOKEN))
-    return JIRA(server=JIRA_BASE_URL, basic_auth=(JIRA_USERNAME, JIRA_PASSWORD))
+def get_client() -> Jira:
+    """
+    Create a Jira client. For Cloud, pass your Atlassian email + API token.
+    For Server/DC, pass username + password or PAT (if configured).
+    """
+    return Jira(
+        url=JIRA_BASE_URL,
+        username=JIRA_USERNAME_OR_EMAIL,
+        password=JIRA_API_TOKEN_OR_PASSWORD,
+        verify_ssl=VERIFY_SSL,
+        # cloud=True  # optional; older versions sometimes require this for Cloud
+    )
 
 
-def build_fields(parent_key: str, parent_summary: str) -> Dict:
-    """Build fields for a Sub-task under a given parent, naming with prefix + parent summary."""
-    summary = f"{SUBTASK_PREFIX} {parent_summary}".strip()
+def parent_summary(jira: Jira, parent_key: str) -> str:
+    """
+    Fetch the parent's summary using atlassian-python-api.
+    Returns the key if the summary can't be read.
+    """
+    try:
+        issue = jira.issue(parent_key)  # dict
+        return issue.get("fields", {}).get("summary") or parent_key
+    except Exception as e:
+        print(f"[WARN] Could not fetch summary for {parent_key}: {e}")
+        return parent_key
+
+
+def build_fields(parent_key: str, parent_sum: str) -> Dict:
+    """
+    Build the fields payload for the sub-task.
+    """
+    summary = f"{SUBTASK_PREFIX} {parent_sum}".strip()
     fields: Dict = {
         "project": {"key": PROJECT_KEY},
         "parent": {"key": parent_key},
@@ -63,53 +82,48 @@ def build_fields(parent_key: str, parent_summary: str) -> Dict:
         "summary": summary,
         "description": SUBTASK_DESCRIPTION,
     }
+
     if LABELS:
         fields["labels"] = LABELS
     if COMPONENT_NAMES:
         fields["components"] = [{"name": c} for c in COMPONENT_NAMES]
-    if USE_CLOUD and ASSIGNEE_ACCOUNT_ID_CLOUD:
+
+    # Assignee handling
+    if ASSIGNEE_ACCOUNT_ID_CLOUD:
         fields["assignee"] = {"accountId": ASSIGNEE_ACCOUNT_ID_CLOUD}
-    elif not USE_CLOUD and ASSIGNEE_NAME_SERVER:
+    elif ASSIGNEE_NAME_SERVER:
         fields["assignee"] = {"name": ASSIGNEE_NAME_SERVER}
+
     return fields
 
 
-def create_subtask_for_parent(jira: JIRA, parent_key: str) -> Optional[str]:
+def create_subtask(jira: Jira, parent_key: str) -> Optional[str]:
+    """
+    Create a single sub-task under the given parent.
+    Returns the created issue key, or None on failure.
+    """
     try:
-        parent = jira.issue(parent_key)
-        parent_summary = parent.fields.summary or parent_key
-        if parent.fields.project.key != PROJECT_KEY:
-            print(f"[WARN] Parent {parent_key} is in project {parent.fields.project.key}, "
-                  f"but PROJECT_KEY is {PROJECT_KEY}. Proceeding.")
-        fields = build_fields(parent_key, parent_summary)
-        issue = jira.create_issue(fields=fields)
-        print(f"[OK] Created Sub-task {issue.key} under {parent_key}: {fields['summary']}")
-        return issue.key
-    except JIRAError as e:
-        print(f"[ERROR] {parent_key}: {getattr(e, 'text', str(e))}")
+        ps = parent_summary(jira, parent_key)
+        fields = build_fields(parent_key, ps)
+        created = jira.create_issue(fields=fields)  # dict with key, id, self...
+        key = created.get("key") or str(created)
+        print(f"[OK] Created Sub-task {key} under {parent_key}: {fields['summary']}")
+        return key
     except Exception as e:
-        print(f"[ERROR] {parent_key}: {e}")
-    return None
+        print(f"[ERROR] Failed to create Sub-task under {parent_key}: {e}")
+        return None
 
 
 def main():
-    jira = get_jira_client()
-    # Optional: check sub-task issue type exists (may be restricted by perms)
-    try:
-        meta = jira.createmeta(projectKeys=PROJECT_KEY, expand="projects.issuetypes.fields")
-        issue_types = {it["name"] for p in meta.get("projects", []) for it in p.get("issuetypes", [])}
-        if SUBTASK_ISSUE_TYPE_NAME not in issue_types:
-            print(f"[WARN] Issue type '{SUBTASK_ISSUE_TYPE_NAME}' not visible in create meta; "
-                  f"ensure it's enabled for the project.")
-    except Exception:
-        pass
+    jira = get_client()
 
-    created = []
-    for key in PARENT_ISSUE_KEYS:
-        out = create_subtask_for_parent(jira, key)
+    created_keys = []
+    for k in PARENT_ISSUE_KEYS:
+        out = create_subtask(jira, k)
         if out:
-            created.append(out)
-    print(f"\nDone. Created {len(created)} Sub-task(s): {created}")
+            created_keys.append(out)
+
+    print(f"\nDone. Created {len(created_keys)} Sub-task(s): {created_keys}")
 
 
 if __name__ == "__main__":
